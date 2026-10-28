@@ -57,6 +57,7 @@ from .exceptions import (
 )
 from .async_fleet import AsyncSandboxFleet
 from .fleet import FleetPlan, PlanEntry, SandboxFleet
+from .lookahead import LookaheadWarmer, WarmReport
 from .reaper import reap, reap_orphans
 from .handles import SandboxHandle, SandboxSession
 from .observability import Observer, RunReport, repo_family, serve_metrics
@@ -86,7 +87,18 @@ from .sizing import (
     recommend_window_disk,
     recommend_window_pipelined,
 )
-from .sources import JsonlSource, ListSource, Task, TaskSource, to_tasks
+from .sources import (
+    DEFAULT_IMAGE_FIELDS,
+    ImageListSource,
+    JsonlSource,
+    ListSource,
+    Task,
+    TaskSource,
+    extract_image,
+    load_image_list,
+    read_text,
+    to_tasks,
+)
 from .strategies import STRATEGIES, process_parallel
 
 __all__ = [
@@ -116,6 +128,11 @@ __all__ = [
     "ListSource",
     "JsonlSource",
     "to_tasks",
+    "extract_image",
+    "load_image_list",
+    "read_text",
+    "ImageListSource",
+    "DEFAULT_IMAGE_FIELDS",
     # swebench adapter
     "SweBenchSource",
     "swebench_probe",
@@ -134,6 +151,8 @@ __all__ = [
     "ImageAffinity",
     # fleet
     "SandboxFleet",
+    "LookaheadWarmer",
+    "WarmReport",
     "AsyncSandboxFleet",
     "FleetPlan",
     "PlanEntry",

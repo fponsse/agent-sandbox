@@ -37,6 +37,7 @@ The specifications live in [`spec/`](spec/):
 | Surface | Spec |
 |---|---|
 | `ProcessService` (gRPC) | [`spec/process/v1/process.proto`](spec/process/v1/process.proto) |
+| `FileWatcherService` (gRPC) | [`spec/watcher/v1/watcher.proto`](spec/watcher/v1/watcher.proto) |
 | Filesystem & Runtime REST API | [`spec/filesystem/v1/filesystem.yaml`](spec/filesystem/v1/filesystem.yaml) |
 
 ## Implementing a compatible runtime
@@ -51,6 +52,15 @@ same workspace and execution environment:
   `InitEvent` before process output, zero or more `stdout`/`stderr` events,
   and one final `ExitEvent`. The process ID from `InitEvent` is the handle
   used by `WriteStdin`, `SendSignal`, and `ResizeTTY`.
+- Optionally serve `watcher.v1.FileWatcherService`. The SDKs reject the call
+  upfront with `ErrUnsupportedByRuntime` (Go) / `RuntimeError` (Python) only
+  when the configured runtime is the legacy python-runtime. Against a runtime
+  that does not serve the service, the `Unimplemented` gRPC status surfaces
+  from the stream instead: the Go SDK delivers it as a terminal `error`
+  FileEvent, and the Python SDK raises `RuntimeError` during iteration. A
+  compatible runtime that wants watcher support must implement `WatchDir` with
+  the same path-confinement and terminal-ERROR semantics as the reference
+  server.
 - Serve the `/v1/files`, `/v1/health`, and `/v1/metadata` REST resources with
   the status codes and JSON shapes in the OpenAPI document. File payloads are
   raw bytes rather than base64; `PUT` accepts both an octet-stream body and a
@@ -113,13 +123,44 @@ process IDs, `PERMISSION_DENIED` for a `cwd` escaping the sandbox root,
 `exit_code` is the process's exit status, or `128+n` when signal `n` killed
 it (e.g. `137` for `SIGKILL`), as a shell reports it.
 
+### FileWatcherService (gRPC, `:9090`)
+
+| RPC | Type | Purpose |
+|---|---|---|
+| `WatchDir` | Server stream | Stream filesystem events (create, write, remove, rename, chmod) for a directory. Optional recursive mode. |
+
+Events are batched in ~250ms windows and flushed in order; individual
+events are not merged. For renames, `path` carries the old (source) name;
+when the new name lands inside the watched tree it arrives as a separate
+`create` event — clients reconstruct renames by pairing the two. Each
+event path is re-validated against the sandbox root on delivery to prevent
+symlink-swap escapes. Terminal
+conditions (watched directory removed, unrecoverable watcher error) are
+surfaced as a final `FileEvent` with type `ERROR` before the stream
+closes, rather than as a gRPC status code, so clients can distinguish
+transport failures from intentional termination. Non-fatal problems
+(event overflow, subdirectories that could not be watched in recursive
+mode) also arrive as `ERROR` events, but the stream continues.
+
+Errors that prevent the watch from starting surface as standard gRPC
+status codes (`NOT_FOUND` for a non-existent path, `PERMISSION_DENIED`
+for a path escaping the sandbox root, `INVALID_ARGUMENT` for a
+non-directory path).
+
+`FileWatcherService` is optional for compatible runtimes. The SDKs reject
+the call with `ErrUnsupportedByRuntime` (Go) / `RuntimeError` (Python) when
+the configured runtime is the legacy python-runtime; against a runtime that
+does not serve the service, the `Unimplemented` gRPC status surfaces from the
+stream as a terminal `error` FileEvent (Go) or a `RuntimeError` raised during
+iteration (Python).
+
 ### Filesystem & Runtime REST API (`:8080`)
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| `GET` | `/v1/files/{path}` | File → raw bytes (`application/octet-stream`); directory → JSON `DirectoryListing`. |
+| `GET` | `/v1/files/{path}` | File → raw bytes (`application/octet-stream`); directory → JSON `DirectoryListing`. Optional `type` query (`file` or `directory`, also on `HEAD`): `409` if the path is the other kind. |
 | `HEAD` | `/v1/files/{path}` | Existence/metadata probe without transferring the body. |
-| `PUT` | `/v1/files/{path}` | Atomic write (temp file + rename), auto-creates parents. Optional `mode` query (`^0[0-7]{3}$`, default `0644`). Accepts raw bytes or `multipart/form-data` (`file` part). |
+| `PUT` | `/v1/files/{path}` | Atomic write (temp file + rename), auto-creates parents. Optional `mode` query (`^0[0-7]{3}$`, default `0644`). `append=true` adds to the end of the file instead (not atomic). Accepts raw bytes or `multipart/form-data` (`file` part). |
 | `DELETE` | `/v1/files/{path}` | Remove a file or directory; `recursive=true` for `rm -rf` behavior; `409` on a non-empty directory otherwise. |
 | `GET` | `/v1/health` | Readiness probe: `200 {"status":"ok"}` or `503` during shutdown. |
 | `GET` | `/v1/metadata` | Orchestrator-injected, non-sensitive environment variables (allowlisted by prefix, default `SANDBOX_`). |
@@ -131,8 +172,8 @@ default) via symlink-aware sanitization; traversal attempts return
 ### Concurrency semantics
 
 Requests are handled in parallel, with no server-side serialization. The
-atomic-write strategy prevents partial file contents, but it does not impose an
-ordering across requests:
+atomic-write strategy prevents partial file contents for replacement writes (not
+appends, see below), but it does not impose an ordering across requests:
 
 - **Write vs. read** — a successful read sees either the complete previous
   file or the complete new one, never partial content. A read racing with a
@@ -144,6 +185,9 @@ ordering across requests:
   complete after the path is deleted; a read that has not opened it may fail.
 - **Concurrent writes to one path** — each successful rename is atomic; the
   last successful rename determines the final contents.
+- **Appends (`append=true`)** are written in place, not atomically: a read can
+  see a partial append, and concurrent appends to one path can interleave. A
+  retried append adds the body again.
 
 There is no cross-request transaction or compare-and-swap; agents that need
 ordering or coordination on shared paths must layer it themselves.
@@ -218,6 +262,9 @@ curl -sf localhost:8080/v1/files/src
 
 # Existence probe
 curl -sf -I localhost:8080/v1/files/src/main.py
+
+# Append
+curl -sf -X PUT --data-binary "more" "localhost:8080/v1/files/src/main.py?append=true"
 
 # Delete recursively
 curl -sf -X DELETE "localhost:8080/v1/files/src?recursive=true"
